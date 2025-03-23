@@ -1,0 +1,5 @@
+{"level":"error","message":"Error fetching sales from Montonio: Request failed with status code 404","service":"montonio-merit-middleware","timestamp":"2025-03-21 19:57:24"}
+{"level":"error","message":"Error fetching orders from Montonio: Cannot read properties of undefined (reading 'length')","service":"montonio-merit-middleware","timestamp":"2025-03-21 19:59:38"}
+{"level":"error","message":"Error fetching orders from Montonio: Request failed with status code 400","service":"montonio-merit-middleware","timestamp":"2025-03-21 20:01:30"}
+{"level":"error","message":"Error fetching orders by date range: Request failed with status code 400","service":"montonio-merit-middleware","timestamp":"2025-03-21 20:01:30"}
+{"level":"error","message":"Error fetching order 0b6f1eff-c41d-470f-a0c3-20369943bc07 from Montonio: Request failed with status code 400","service":"montonio-merit-middleware","timestamp":"2025-03-21 20:02:39"}

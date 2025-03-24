@@ -33,9 +33,9 @@ module.exports = {
   },
   
   woocommerce: {
-    apiUrl: process.env.WOOCOMMERCE_API_URL,
-    apiKey: process.env.WOOCOMMERCE_API_KEY,
-    apiSecret: process.env.WOOCOMMERCE_API_SECRET,
+    apiUrl: process.env.WOOCOMMERCE_URL || process.env.WOOCOMMERCE_API_URL,
+    apiKey: process.env.WOOCOMMERCE_CONSUMER_KEY || process.env.WOOCOMMERCE_API_KEY,
+    apiSecret: process.env.WOOCOMMERCE_CONSUMER_SECRET || process.env.WOOCOMMERCE_API_SECRET,
     webhookSecret: process.env.WOOCOMMERCE_WEBHOOK_SECRET
   }
 }; 

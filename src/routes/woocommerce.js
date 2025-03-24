@@ -9,6 +9,15 @@ const meritService = require('../services/merit');
 const logger = require('../utils/logger');
 const config = require('../config');
 
+// Track the auto-sync state
+const autoSyncState = {
+  isRunning: false,
+  startOrderId: null,
+  currentOrderId: null, 
+  lastSyncTime: null,
+  intervalId: null
+};
+
 /**
  * @route   GET /api/woocommerce/orders
  * @desc    Get WooCommerce orders with pagination and filtering
@@ -205,21 +214,9 @@ router.post('/orders/:orderId/create-invoice', async (req, res) => {
       });
     }
     
-    // Fetch order from WooCommerce
-    const WooCommerceRestApi = require('@woocommerce/woocommerce-rest-api').default;
-    
-    logger.info(`Initializing WooCommerce API with URL: ${config.woocommerce.apiUrl}`);
-    
-    const api = new WooCommerceRestApi({
-      url: config.woocommerce.apiUrl,
-      consumerKey: config.woocommerce.apiKey,
-      consumerSecret: config.woocommerce.apiSecret,
-      version: 'wc/v3'
-    });
-    
-    // Get the order
+    // Get the order using the woocommerceService
     logger.info(`Fetching WooCommerce order #${orderId}`);
-    const { data: order } = await api.get(`orders/${orderId}`);
+    const order = await woocommerceService.getOrderById(orderId);
     
     if (!order || !order.id) {
       logger.error(`Order #${orderId} not found in WooCommerce`);
@@ -251,6 +248,318 @@ router.post('/orders/:orderId/create-invoice', async (req, res) => {
       error: error.message
     });
   }
+});
+
+/**
+ * Start automatic creation of Merit invoices from WooCommerce orders
+ * @route POST /api/woocommerce/auto-sync/start
+ */
+router.post('/auto-sync/start', async (req, res) => {
+  try {
+    const { startOrderId } = req.body;
+    
+    if (!startOrderId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required parameter: startOrderId'
+      });
+    }
+    
+    // Check if auto-sync is already running
+    if (autoSyncState.isRunning) {
+      return res.status(400).json({
+        success: false,
+        error: 'Auto-sync is already running',
+        syncState: autoSyncState
+      });
+    }
+    
+    // Check if WooCommerce API is configured
+    if (!config.woocommerce?.apiUrl || !config.woocommerce?.apiKey || !config.woocommerce?.apiSecret) {
+      return res.status(500).json({ 
+        success: false, 
+        error: 'WooCommerce API not configured.' 
+      });
+    }
+    
+    // Update state
+    autoSyncState.isRunning = true;
+    autoSyncState.startOrderId = startOrderId;
+    autoSyncState.currentOrderId = startOrderId;
+    autoSyncState.lastSyncTime = new Date();
+    
+    // Start initial sync in background and respond to client immediately
+    res.status(200).json({
+      success: true,
+      message: `Auto-sync started from order ID ${startOrderId}`,
+      syncState: autoSyncState
+    });
+    
+    // Start the initial bulk sync process in the background
+    processBulkOrders().then(() => {
+      // After bulk processing is complete, set up interval for periodic checking
+      autoSyncState.intervalId = setInterval(processNewOrders, 5 * 60 * 1000);
+      logger.info('Initial bulk sync completed. Now checking for new orders every 5 minutes.');
+    }).catch(err => {
+      logger.error(`Error in bulk processing: ${err.message}`);
+      // Even if bulk processing fails, still set up interval for future checks
+      autoSyncState.intervalId = setInterval(processNewOrders, 5 * 60 * 1000);
+    });
+    
+    /**
+     * Process bulk orders from the starting ID up
+     */
+    async function processBulkOrders() {
+      logger.info(`Starting bulk sync from order ID ${autoSyncState.startOrderId}`);
+      
+      // Get all existing Merit invoices to check for duplicates
+      const meritInvoices = await fetchMeritInvoices();
+      const existingOrderIds = extractOrderIdsFromInvoices(meritInvoices);
+      logger.info(`Found ${existingOrderIds.size} existing Merit invoices to avoid duplicates`);
+      
+      let page = 1;
+      let hasMoreOrders = true;
+      let allFilteredOrders = [];
+      const maxOrdersToProcess = 1000; // Set a safety limit
+      
+      // First, collect all orders that match our criteria
+      // Fetch using 'desc' order so we get the newest orders first where our starting ID is likely to be found
+      while (hasMoreOrders && allFilteredOrders.length < maxOrdersToProcess) {
+        logger.info(`Fetching WooCommerce orders batch page ${page} in descending order...`);
+        
+        try {
+          // Fetch a batch of orders using the woocommerceService
+          const ordersResponse = await woocommerceService.getOrders({
+            page: page,
+            per_page: 100,
+            order: 'desc' // Get newest orders first
+          });
+          
+          const orders = ordersResponse.orders;
+          
+          if (!orders || orders.length === 0) {
+            hasMoreOrders = false;
+            logger.info('No more orders to fetch.');
+            break;
+          }
+          
+          // Filter orders based on the starting ID
+          const filteredOrders = orders.filter(order => parseInt(order.id) >= parseInt(autoSyncState.startOrderId));
+          allFilteredOrders = [...allFilteredOrders, ...filteredOrders];
+          
+          logger.info(`Found ${filteredOrders.length} orders matching criteria on page ${page}`);
+          
+          // If we got a full page of orders, there might be more
+          hasMoreOrders = orders.length === 100;
+          page++;
+          
+          // If we have enough orders or we've gone through enough pages, stop fetching
+          if (allFilteredOrders.length >= maxOrdersToProcess || page > 10) {
+            logger.info(`Reached collection limit. Stopping order fetch.`);
+            hasMoreOrders = false;
+          }
+          
+        } catch (error) {
+          logger.error(`Error fetching WooCommerce orders (page ${page}): ${error.message}`);
+          // If we encounter an error, stop processing
+          hasMoreOrders = false;
+        }
+      }
+      
+      // Sort all collected orders by ID in ascending order
+      allFilteredOrders.sort((a, b) => parseInt(a.id) - parseInt(b.id));
+      
+      logger.info(`Collected ${allFilteredOrders.length} orders to process`);
+      logger.info(`Order ID range: ${allFilteredOrders.length > 0 ? `${allFilteredOrders[0].id} to ${allFilteredOrders[allFilteredOrders.length-1].id}` : 'none'}`);
+      
+      // Process each order in ascending order
+      for (const order of allFilteredOrders) {
+        try {
+          // Skip if we've already created an invoice for this order
+          if (existingOrderIds.has(order.id.toString())) {
+            logger.info(`Order #${order.id} already has a Merit invoice. Skipping.`);
+            continue;
+          }
+          
+          // Process the order if it doesn't have an invoice yet
+          logger.info(`Creating Merit invoice for WooCommerce order #${order.id}`);
+          const invoice = await meritService.createInvoiceFromWooCommerceOrder(order);
+          logger.info(`Successfully created Merit invoice for order #${order.id}: Invoice number ${invoice.InvoiceNo || 'unknown'}`);
+          
+          // Update current order ID in state
+          autoSyncState.currentOrderId = order.id;
+          
+          // Add to our local cache of processed orders
+          existingOrderIds.add(order.id.toString());
+          
+          // Short delay to avoid overwhelming the Merit API
+          await new Promise(resolve => setTimeout(resolve, 500));
+        } catch (error) {
+          logger.error(`Error processing order #${order.id}: ${error.message}`);
+          // Continue to the next order
+        }
+      }
+      
+      // Update the last sync time
+      autoSyncState.lastSyncTime = new Date();
+      logger.info(`Bulk sync completed at ${autoSyncState.lastSyncTime.toISOString()}`);
+    }
+    
+    /**
+     * Process new orders that have been created since the last sync
+     */
+    async function processNewOrders() {
+      try {
+        logger.info(`Checking for new orders since ${autoSyncState.lastSyncTime.toISOString()}`);
+        
+        // Fetch orders created after the last sync time
+        const ordersResponse = await woocommerceService.getOrders({
+          after: autoSyncState.lastSyncTime.toISOString(),
+          per_page: 100,
+          order: 'asc'
+        });
+        
+        const orders = ordersResponse.orders;
+        
+        if (!orders || orders.length === 0) {
+          logger.info('No new orders found. Will check again later.');
+          autoSyncState.lastSyncTime = new Date();
+          return;
+        }
+        
+        logger.info(`Found ${orders.length} new order(s) to process`);
+        
+        // Get all existing Merit invoices to check for duplicates
+        const meritInvoices = await fetchMeritInvoices();
+        const existingOrderIds = extractOrderIdsFromInvoices(meritInvoices);
+        
+        // Process orders in sequence
+        for (const order of orders) {
+          try {
+            // Skip if we've already created an invoice for this order
+            if (existingOrderIds.has(order.id.toString())) {
+              logger.info(`Order #${order.id} already has a Merit invoice. Skipping.`);
+              continue;
+            }
+            
+            // Process the order if it doesn't have an invoice yet
+            logger.info(`Creating Merit invoice for WooCommerce order #${order.id}`);
+            const invoice = await meritService.createInvoiceFromWooCommerceOrder(order);
+            logger.info(`Successfully created Merit invoice for order #${order.id}: Invoice number ${invoice.InvoiceNo || 'unknown'}`);
+            
+            // Update current order ID in state
+            autoSyncState.currentOrderId = order.id;
+            
+            // Short delay to avoid overwhelming the Merit API
+            await new Promise(resolve => setTimeout(resolve, 500));
+          } catch (error) {
+            logger.error(`Error processing order #${order.id}: ${error.message}`);
+            // Continue to the next order
+          }
+        }
+        
+        // Update the last sync time
+        autoSyncState.lastSyncTime = new Date();
+        logger.info(`Periodic sync completed at ${autoSyncState.lastSyncTime.toISOString()}`);
+        
+      } catch (error) {
+        logger.error(`Error in periodic sync: ${error.message}`);
+      }
+    }
+    
+    /**
+     * Fetch recent invoices from Merit
+     */
+    async function fetchMeritInvoices() {
+      // Look back 3 months
+      const startDate = new Date();
+      startDate.setMonth(startDate.getMonth() - 3);
+      
+      const endDate = new Date();
+      
+      // Format dates as YYYYMMDD for Merit API
+      const startDateFormat = startDate.toISOString().slice(0, 10).replace(/-/g, '');
+      const endDateFormat = endDate.toISOString().slice(0, 10).replace(/-/g, '');
+      
+      const options = {
+        startDate: startDateFormat,
+        endDate: endDateFormat,
+        unpaidOnly: false,
+        limit: 1000 // Get more invoices to reduce API calls
+      };
+      
+      return await meritService.getInvoices(options);
+    }
+    
+    /**
+     * Extract order IDs from Merit invoices
+     */
+    function extractOrderIdsFromInvoices(meritInvoices) {
+      const orderIds = new Set();
+      
+      if (meritInvoices && meritInvoices.invoices && meritInvoices.invoices.length > 0) {
+        meritInvoices.invoices.forEach(invoice => {
+          const extractedOrderNumber = meritService.extractOrderNumberFromHComment(invoice.HComment);
+          if (extractedOrderNumber) {
+            orderIds.add(extractedOrderNumber);
+          }
+        });
+      }
+      
+      return orderIds;
+    }
+    
+  } catch (error) {
+    logger.error(`Error starting auto-sync: ${error.message}`);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * Stop automatic creation of Merit invoices
+ * @route POST /api/woocommerce/auto-sync/stop
+ */
+router.post('/auto-sync/stop', (req, res) => {
+  if (!autoSyncState.isRunning) {
+    return res.status(400).json({
+      success: false,
+      error: 'Auto-sync is not running'
+    });
+  }
+  
+  // Clear the interval
+  if (autoSyncState.intervalId) {
+    clearInterval(autoSyncState.intervalId);
+    autoSyncState.intervalId = null;
+  }
+  
+  // Update state
+  autoSyncState.isRunning = false;
+  
+  return res.status(200).json({
+    success: true,
+    message: 'Auto-sync stopped',
+    syncState: autoSyncState
+  });
+});
+
+/**
+ * Get the current status of auto-sync
+ * @route GET /api/woocommerce/auto-sync/status
+ */
+router.get('/auto-sync/status', (req, res) => {
+  return res.status(200).json({
+    success: true,
+    syncState: {
+      isRunning: autoSyncState.isRunning,
+      startOrderId: autoSyncState.startOrderId,
+      currentOrderId: autoSyncState.currentOrderId,
+      lastSyncTime: autoSyncState.lastSyncTime
+    }
+  });
 });
 
 module.exports = router; 

@@ -298,12 +298,12 @@ router.post('/auto-sync/start', async (req, res) => {
     // Start the initial bulk sync process in the background
     processBulkOrders().then(() => {
       // After bulk processing is complete, set up interval for periodic checking
-      autoSyncState.intervalId = setInterval(processNewOrders, 5 * 60 * 1000);
-      logger.info('Initial bulk sync completed. Now checking for new orders every 5 minutes.');
+      autoSyncState.intervalId = setInterval(processNewOrders, 30 * 1000);
+      logger.info('Initial bulk sync completed. Now checking for new orders every 30 seconds.');
     }).catch(err => {
       logger.error(`Error in bulk processing: ${err.message}`);
       // Even if bulk processing fails, still set up interval for future checks
-      autoSyncState.intervalId = setInterval(processNewOrders, 5 * 60 * 1000);
+      autoSyncState.intervalId = setInterval(processNewOrders, 30 * 1000);
     });
     
     /**
@@ -412,6 +412,11 @@ router.post('/auto-sync/start', async (req, res) => {
       try {
         logger.info(`Checking for new orders since ${autoSyncState.lastSyncTime.toISOString()}`);
         
+        // Always fetch latest Merit invoices first to ensure we have up-to-date data
+        const meritInvoices = await fetchMeritInvoices();
+        const existingOrderIds = extractOrderIdsFromInvoices(meritInvoices);
+        logger.info(`Fetched ${existingOrderIds.size} existing Merit invoices to check for duplicates`);
+        
         // Fetch orders created after the last sync time
         const ordersResponse = await woocommerceService.getOrders({
           after: autoSyncState.lastSyncTime.toISOString(),
@@ -422,16 +427,12 @@ router.post('/auto-sync/start', async (req, res) => {
         const orders = ordersResponse.orders;
         
         if (!orders || orders.length === 0) {
-          logger.info('No new orders found. Will check again later.');
+          logger.info('No new orders found. Will check again in 30 seconds.');
           autoSyncState.lastSyncTime = new Date();
           return;
         }
         
         logger.info(`Found ${orders.length} new order(s) to process`);
-        
-        // Get all existing Merit invoices to check for duplicates
-        const meritInvoices = await fetchMeritInvoices();
-        const existingOrderIds = extractOrderIdsFromInvoices(meritInvoices);
         
         // Process orders in sequence
         for (const order of orders) {
@@ -449,6 +450,9 @@ router.post('/auto-sync/start', async (req, res) => {
             
             // Update current order ID in state
             autoSyncState.currentOrderId = order.id;
+            
+            // Add to our local cache of processed orders
+            existingOrderIds.add(order.id.toString());
             
             // Short delay to avoid overwhelming the Merit API
             await new Promise(resolve => setTimeout(resolve, 500));

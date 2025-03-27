@@ -343,11 +343,14 @@ router.post('/auto-sync/start', async (req, res) => {
             break;
           }
           
-          // Filter orders based on the starting ID
-          const filteredOrders = orders.filter(order => parseInt(order.id) >= parseInt(autoSyncState.startOrderId));
+          // Filter orders based on the starting ID and exclude cancelled orders
+          const filteredOrders = orders.filter(order => 
+            parseInt(order.id) >= parseInt(autoSyncState.startOrderId) && 
+            order.status !== 'cancelled'
+          );
           allFilteredOrders = [...allFilteredOrders, ...filteredOrders];
           
-          logger.info(`Found ${filteredOrders.length} orders matching criteria on page ${page}`);
+          logger.info(`Found ${filteredOrders.length} valid orders matching criteria on page ${page}`);
           
           // If we got a full page of orders, there might be more
           hasMoreOrders = orders.length === 100;
@@ -369,7 +372,7 @@ router.post('/auto-sync/start', async (req, res) => {
       // Sort all collected orders by ID in ascending order
       allFilteredOrders.sort((a, b) => parseInt(a.id) - parseInt(b.id));
       
-      logger.info(`Collected ${allFilteredOrders.length} orders to process`);
+      logger.info(`Collected ${allFilteredOrders.length} valid orders to process`);
       logger.info(`Order ID range: ${allFilteredOrders.length > 0 ? `${allFilteredOrders[0].id} to ${allFilteredOrders[allFilteredOrders.length-1].id}` : 'none'}`);
       
       // Process each order in ascending order
@@ -432,10 +435,12 @@ router.post('/auto-sync/start', async (req, res) => {
           return;
         }
         
-        logger.info(`Found ${orders.length} new order(s) to process`);
+        // Filter out cancelled orders
+        const validOrders = orders.filter(order => order.status !== 'cancelled');
+        logger.info(`Found ${validOrders.length} valid new order(s) to process (${orders.length - validOrders.length} cancelled orders skipped)`);
         
         // Process orders in sequence
-        for (const order of orders) {
+        for (const order of validOrders) {
           try {
             // Skip if we've already created an invoice for this order
             if (existingOrderIds.has(order.id.toString())) {
